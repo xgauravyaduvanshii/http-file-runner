@@ -29,6 +29,19 @@ requests:
     url: "{{BASE_URL}}/users/1"
     headers:
       Authorization: "Bearer {{token}}"
+    retry:
+      count: 2
+      delayMs: 100
+      on:
+        - 500
+        - 502
+        - 503
+    mock:
+      status: 200
+      body:
+        user:
+          id: 1
+          name: Ada Lovelace
     expect:
       status: 200
       json:

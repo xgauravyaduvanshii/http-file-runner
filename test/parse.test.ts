@@ -43,6 +43,11 @@ describe("parseYaml (minimal subset)", () => {
     expect(parseYaml("x: 42\n")).toEqual({ x: 42 });
   });
 
+  it("parses a list of scalars", () => {
+    const doc = parseYaml("on:\n  - 500\n  - 502\n") as Record<string, unknown>;
+    expect(doc.on).toEqual([500, 502]);
+  });
+
   it("parses a list under a key at the same indent", () => {
     const doc = parseYaml("requests:\n- name: a\n- name: b\n") as Record<string, unknown>;
     expect(doc.requests).toEqual([{ name: "a" }, { name: "b" }]);
@@ -97,5 +102,40 @@ describe("parseCollection", () => {
     expect(() =>
       parseCollection("requests:\n  - name: a\n    url: http://x/\n    expect:\n      status: ok\n"),
     ).toThrow(/expect\.status/);
+  });
+
+  it("parses retry with count, delayMs and a block list of statuses", () => {
+    const col = parseCollection(
+      "requests:\n  - name: flaky\n    url: http://x/flaky\n    retry:\n      count: 2\n      delayMs: 50\n      on:\n        - 500\n        - 502\n",
+    );
+    expect(col.requests[0].retry).toEqual({ count: 2, delayMs: 50, on: [500, 502] });
+  });
+
+  it("defaults retry delayMs to 100 and on to 500/502/503/504", () => {
+    const col = parseCollection("requests:\n  - name: flaky\n    url: http://x/flaky\n    retry:\n      count: 1\n");
+    expect(col.requests[0].retry).toEqual({ count: 1, delayMs: 100, on: [500, 502, 503, 504] });
+  });
+
+  it("rejects a negative retry count and a non-list retry.on", () => {
+    expect(() =>
+      parseCollection("requests:\n  - name: a\n    url: http://x/\n    retry:\n      count: -1\n"),
+    ).toThrow(/retry\.count/);
+    expect(() =>
+      parseCollection("requests:\n  - name: a\n    url: http://x/\n    retry:\n      count: 1\n      on: 500\n"),
+    ).toThrow(/retry\.on/);
+  });
+
+  it("parses a mock with status and a mapping body", () => {
+    const col = parseCollection(
+      "requests:\n  - name: get-user\n    url: http://x/users/1\n    mock:\n      status: 200\n      body:\n        user:\n          id: 1\n",
+    );
+    expect(col.requests[0].mock?.status).toBe(200);
+    expect(col.requests[0].mock?.body).toEqual({ user: { id: 1 } });
+  });
+
+  it("rejects an out-of-range mock status", () => {
+    expect(() =>
+      parseCollection("requests:\n  - name: a\n    url: http://x/\n    mock:\n      status: 99\n"),
+    ).toThrow(/mock\.status/);
   });
 });

@@ -2,8 +2,9 @@
 /**
  * http-run — run named HTTP requests from a requests.yaml file.
  *
- *   http-run run <name> [--file requests.yaml] [--env dev] [--ci] [--report out.json]
+ *   http-run run <name> [--file requests.yaml] [--env dev] [--ci] [--report out.json] [--report-html out.html]
  *   http-run run --all [--file requests.yaml] [--env dev] [--ci]
+ *   http-run serve [requests.yaml] [--port 3000] [--host 127.0.0.1]
  *   http-run list [--file requests.yaml]
  *   http-run export <name> [--file requests.yaml] [--env dev]
  *   http-run init [dir] [--force]
@@ -19,8 +20,10 @@ import { join, resolve } from "node:path";
 import { parseCollection, type Collection } from "./parse.js";
 import { loadEnvFile, mergeVars, type Vars } from "./env.js";
 import { buildCurl, runCollection, type RunResult } from "./run.js";
+import { generateHtmlReport } from "./report.js";
+import { startMockServer } from "./serve.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 const SAMPLE_REQUESTS = `# http-file-runner sample collection.
 # Copy this file, change BASE_URL, and run: http-run run --all
@@ -53,6 +56,19 @@ requests:
     url: "{{BASE_URL}}/users/1"
     headers:
       Authorization: "Bearer {{token}}"
+    retry:
+      count: 2
+      delayMs: 100
+      on:
+        - 500
+        - 502
+        - 503
+    mock:
+      status: 200
+      body:
+        user:
+          id: 1
+          name: Ada Lovelace
     expect:
       status: 200
       json:
@@ -73,6 +89,9 @@ interface Options {
   envFile?: string[];
   ci?: boolean;
   report?: string;
+  reportHtml?: string;
+  port?: number;
+  host?: string;
   json?: boolean;
   force?: boolean;
   all?: boolean;
@@ -82,8 +101,9 @@ function printHelp(): void {
   console.log(`http-run ${VERSION} — run named HTTP requests from requests.yaml
 
 Usage:
-  http-run run <name> [--file requests.yaml] [--env dev] [--env-file .env] [--ci] [--report out.json]
+  http-run run <name> [--file requests.yaml] [--env dev] [--env-file .env] [--ci] [--report out.json] [--report-html out.html]
   http-run run --all [--file requests.yaml] [--env dev] [--ci]
+  http-run serve [requests.yaml] [--port 3000] [--host 127.0.0.1] [--env dev]
   http-run list [--file requests.yaml]
   http-run export <name> [--file requests.yaml] [--env dev]
   http-run init [dir] [--force]
@@ -95,6 +115,9 @@ Options:
   --env-file <path> Extra env file (.env or .yaml); repeatable, later files win
   --ci              Exit non-zero when any assertion fails (default in CI: same behaviour)
   --report <path>   Write a JSON report of the run to this file
+  --report-html <path>  Write a self-contained HTML report (no response bodies, so no secrets)
+  --port <number>   serve: port to listen on (default 3000)
+  --host <name>     serve: host to listen on (default 127.0.0.1)
   --json            Print the JSON report to stdout instead of the pretty output
   --force           init: overwrite existing files
 
@@ -114,19 +137,34 @@ function parseArgs(argv: string[]): { command: string; positional: string[]; opt
     if (arg === "--ci") { opts.ci = true; continue; }
     if (arg === "--json") { opts.json = true; continue; }
     if (arg === "--force") { opts.force = true; continue; }
-    if (arg === "--file" || arg === "--env" || arg === "--env-file" || arg === "--report") {
+    if (arg === "--file" || arg === "--env" || arg === "--env-file" || arg === "--report" || arg === "--report-html" || arg === "--port" || arg === "--host") {
       const value = argv[++i];
       if (value === undefined) throw new Error(`Missing value for ${arg}`);
       if (arg === "--file") opts.file = value;
       if (arg === "--env") opts.env = value;
       if (arg === "--env-file") opts.envFile!.push(value);
       if (arg === "--report") opts.report = value;
+      if (arg === "--report-html") opts.reportHtml = value;
+      if (arg === "--port") {
+        const port = Number(value);
+        if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`--port must be an integer between 0 and 65535`);
+        opts.port = port;
+      }
+      if (arg === "--host") opts.host = value;
       continue;
     }
     if (arg.startsWith("--file=")) { opts.file = arg.slice("--file=".length); continue; }
     if (arg.startsWith("--env=")) { opts.env = arg.slice("--env=".length); continue; }
     if (arg.startsWith("--env-file=")) { opts.envFile!.push(arg.slice("--env-file=".length)); continue; }
     if (arg.startsWith("--report=")) { opts.report = arg.slice("--report=".length); continue; }
+    if (arg.startsWith("--report-html=")) { opts.reportHtml = arg.slice("--report-html=".length); continue; }
+    if (arg.startsWith("--port=")) {
+      const port = Number(arg.slice("--port=".length));
+      if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`--port must be an integer between 0 and 65535`);
+      opts.port = port;
+      continue;
+    }
+    if (arg.startsWith("--host=")) { opts.host = arg.slice("--host=".length); continue; }
     if (arg.startsWith("-")) throw new Error(`Unknown option: ${arg}`);
     if (!command) command = arg;
     else positional.push(arg);
@@ -160,6 +198,9 @@ function printResult(result: RunResult): void {
   const status = result.status === null ? "ERROR" : String(result.status);
   const verdict = result.passed ? "PASS" : "FAIL";
   console.log(`\n${verdict} ${result.name} — ${result.method} ${result.url} — ${status} (${result.durationMs}ms)`);
+  if (result.attempts > 1) {
+    console.log(`  attempts: ${result.attempts} (statuses: ${result.attemptStatuses.join(" → ")})`);
+  }
   if (result.error) console.log(`  error: ${result.error}`);
   for (const a of result.assertions) {
     console.log(`  ${a.passed ? "✓" : "✗"} ${a.name}: expected ${a.expected}, got ${a.actual}`);
@@ -196,10 +237,39 @@ async function cmdRun(positional: string[], opts: Options): Promise<number> {
     writeFileSync(opts.report, JSON.stringify({ passed, results }, null, 2) + "\n");
     console.log(`Report written to ${opts.report}`);
   }
+  if (opts.reportHtml) {
+    writeFileSync(opts.reportHtml, generateHtmlReport({ passed, results, version: VERSION }));
+    console.log(`HTML report written to ${opts.reportHtml}`);
+  }
   // --ci makes failures fail the process; without it, a failed assertion
   // still exits 1 so scripts cannot silently ignore it. Use --json/--report
   // to inspect the details.
   return passed ? 0 : 1;
+}
+
+async function cmdServe(positional: string[], opts: Options): Promise<number> {
+  // `http-run serve [file]` — the file may also come from --file.
+  const fileArg = positional[0] ?? opts.file;
+  const { collection } = loadCollection(fileArg);
+  const vars = buildVars(collection, opts);
+  const mock = await startMockServer(collection, vars, {
+    port: opts.port ?? 3000,
+    host: opts.host ?? "127.0.0.1",
+  });
+  console.log(`Mock server listening on ${mock.url}`);
+  if (mock.routes.length === 0) {
+    console.log("No requests have a mock: response — add a `mock:` block to a request to serve it.");
+  } else {
+    for (const route of mock.routes) console.log(`  ${route.method} ${route.path}  (${route.name})`);
+  }
+  console.log("Press Ctrl+C to stop.");
+  await new Promise<void>((resolve) => {
+    const stop = (): void => resolve();
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+  });
+  await new Promise<void>((resolve) => mock.server.close(() => resolve()));
+  return 0;
 }
 
 function cmdList(opts: Options): number {
@@ -250,6 +320,8 @@ async function main(): Promise<number> {
         return 0;
       case "run":
         return await cmdRun(positional, opts);
+      case "serve":
+        return await cmdServe(positional, opts);
       case "list":
         return cmdList(opts);
       case "export":

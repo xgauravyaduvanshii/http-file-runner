@@ -6,7 +6,8 @@
  * `{k: v}`), multi-document files, or complex keys. It supports what
  * `requests.yaml` files actually use:
  *   - nested mappings by indentation (2 spaces)
- *   - sequences (`- name: get-user`) including a mapping on the `-` line
+ *   - sequences (`- name: get-user`) including a mapping on the `-` line,
+ *     and sequences of scalars (`- 500`) for lists like `retry.on`
  *   - scalars: quoted strings, numbers, booleans, null, plain strings
  *   - literal block scalars (`|` / `|-`) for request bodies
  *   - `#` comments on their own line, and after an unquoted scalar
@@ -33,6 +34,23 @@ export interface ExpectSpec {
   header?: Record<string, string>;
 }
 
+export interface RetrySpec {
+  /** Number of retries after the first attempt (0 = no retry). */
+  count: number;
+  /** Base delay before the first retry in ms; doubled on each further retry. */
+  delayMs: number;
+  /** HTTP statuses that trigger a retry. Defaults to [500, 502, 503, 504]. */
+  on: number[];
+}
+
+export interface MockSpec {
+  /** HTTP status the mock returns. Defaults to 200. */
+  status?: number;
+  headers?: Record<string, string>;
+  /** Example response: a string (sent as-is), or a JSON value (sent as JSON). */
+  body?: unknown;
+}
+
 export interface RequestSpec {
   name: string;
   method: string;
@@ -41,6 +59,9 @@ export interface RequestSpec {
   /** Request body as a string (usually JSON). Templated with {{VAR}} before sending. */
   body?: string;
   timeoutMs?: number;
+  retry?: RetrySpec;
+  /** Example response used by `http-run serve`. Ignored by `run`. */
+  mock?: MockSpec;
   expect?: ExpectSpec;
   /** var name -> JSON path, e.g. `{ token: "$.token" }`. Captured after a successful run. */
   capture?: Record<string, string>;
@@ -199,6 +220,12 @@ class YamlParser {
         out.push(next && next.indent > indent ? this.parseBlock(next.indent) : null);
         continue;
       }
+      // A scalar list item (`- 500`, `- hello`): no `key:` to parse.
+      if (!splitKeyValue(rest.trim())) {
+        this.pos++;
+        out.push(parseScalar(rest.trim()));
+        continue;
+      }
       // A mapping starting on the `-` line: rewrite it as a map line at
       // indent+2 and let parseMap consume it plus the following lines.
       const childIndent = indent + 2;
@@ -301,6 +328,48 @@ function parseExpect(raw: unknown, name: string): ExpectSpec | undefined {
   return expect;
 }
 
+function parseRetry(raw: unknown, name: string): RetrySpec | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!isRecord(raw)) throw new Error(`Request "${name}": retry must be a mapping`);
+  const count = raw.count ?? 0;
+  if (typeof count !== "number" || !Number.isInteger(count) || count < 0) {
+    throw new Error(`Request "${name}": retry.count must be a non-negative integer`);
+  }
+  const delayMs = raw.delayMs ?? 100;
+  if (typeof delayMs !== "number" || delayMs < 0) {
+    throw new Error(`Request "${name}": retry.delayMs must be a non-negative number`);
+  }
+  let on: number[] = [500, 502, 503, 504];
+  if (raw.on !== undefined) {
+    if (!Array.isArray(raw.on)) throw new Error(`Request "${name}": retry.on must be a list of status codes`);
+    on = [];
+    for (const code of raw.on) {
+      if (typeof code !== "number" || !Number.isInteger(code)) {
+        throw new Error(`Request "${name}": retry.on must be a list of status codes`);
+      }
+      on.push(code);
+    }
+  }
+  return { count, delayMs, on };
+}
+
+function parseMock(raw: unknown, name: string): MockSpec | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!isRecord(raw)) throw new Error(`Request "${name}": mock must be a mapping`);
+  const mock: MockSpec = {};
+  if (raw.status !== undefined) {
+    if (typeof raw.status !== "number" || !Number.isInteger(raw.status) || raw.status < 100 || raw.status > 599) {
+      throw new Error(`Request "${name}": mock.status must be an integer between 100 and 599`);
+    }
+    mock.status = raw.status;
+  }
+  if (raw.headers !== undefined) {
+    mock.headers = stringifyRecord(raw.headers, `Request "${name}": mock.headers`);
+  }
+  if (raw.body !== undefined) mock.body = raw.body;
+  return mock;
+}
+
 function parseRequest(raw: unknown, index: number): RequestSpec {
   if (!isRecord(raw)) throw new Error(`Request #${index + 1} must be a mapping`);
   const name = raw.name;
@@ -326,6 +395,10 @@ function parseRequest(raw: unknown, index: number): RequestSpec {
     if (typeof raw.timeoutMs !== "number") throw new Error(`Request "${name}": timeoutMs must be a number`);
     req.timeoutMs = raw.timeoutMs;
   }
+  const retry = parseRetry(raw.retry, name);
+  if (retry) req.retry = retry;
+  const mock = parseMock(raw.mock, name);
+  if (mock) req.mock = mock;
   if (raw.capture !== undefined) req.capture = stringifyRecord(raw.capture, `Request "${name}": capture`);
   const expect = parseExpect(raw.expect, name);
   if (expect) req.expect = expect;

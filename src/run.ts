@@ -2,6 +2,11 @@
  * Executes requests with the built-in `fetch` (Node 18+), in order,
  * carrying captured variables from one request to the next.
  *
+ * Retries (v0.2.0): a request with `retry:` is re-attempted when the
+ * response status is in `retry.on` (default 500/502/503/504) or the
+ * request fails at the network level, with exponential backoff from
+ * `retry.delayMs`. The result records every attempt's status.
+ *
  * Request headers are templated with `{{VAR}}` but their *values* are
  * never written to the JSON report or to stdout by this module — the
  * CLI prints method, URL, status and body only. A `curl` export is the
@@ -23,6 +28,10 @@ export interface RunResult {
   assertions: AssertionResult[];
   /** Pretty-printed body (JSON) or raw text, for display. */
   body: string;
+  /** Total attempts made, including the first (1 when no retry happened). */
+  attempts: number;
+  /** HTTP status of each attempt, in order (only attempts that got a response). */
+  attemptStatuses: number[];
   error?: string;
 }
 
@@ -104,54 +113,105 @@ export async function executeRequest(
   }
 }
 
-/** Run one request, apply assertions and captures, and return its result. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Run one request, applying retries, assertions and captures, and return its result. */
 export async function runOne(
   spec: RequestSpec,
   vars: Vars,
 ): Promise<{ result: RunResult; captures: Vars }> {
   const started = performance.now();
-  try {
-    const response = await executeRequest(spec, vars);
-    const assertions = runAssertions(spec.expect, response);
-    const passed = assertions.every((a) => a.passed);
-    let captures: Vars = {};
-    if (spec.capture) {
-      const bodyForCapture = response.bodyJson ?? response.bodyText;
-      captures = extractCaptures(bodyForCapture, spec.capture);
+  const retry = spec.retry;
+  const maxAttempts = 1 + (retry?.count ?? 0);
+  const retryOn = retry?.on ?? [500, 502, 503, 504];
+  const attemptStatuses: number[] = [];
+  let attempts = 0;
+  let lastError: string | undefined;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    attempts = attempt + 1;
+    try {
+      const response = await executeRequest(spec, vars);
+      attemptStatuses.push(response.status);
+      const shouldRetry = retryOn.includes(response.status) && attempt + 1 < maxAttempts;
+      if (shouldRetry) {
+        // Exponential backoff: delayMs, then 2x delayMs, then 4x, …
+        await sleep((retry?.delayMs ?? 100) * 2 ** attempt);
+        continue;
+      }
+      const assertions = runAssertions(spec.expect, response);
+      const passed = assertions.every((a) => a.passed);
+      let captures: Vars = {};
+      if (spec.capture) {
+        const bodyForCapture = response.bodyJson ?? response.bodyText;
+        captures = extractCaptures(bodyForCapture, spec.capture);
+      }
+      const body = response.bodyJson !== null
+        ? JSON.stringify(response.bodyJson, null, 2)
+        : response.bodyText;
+      return {
+        result: {
+          name: spec.name,
+          method: spec.method,
+          url: substitute(spec.url, vars),
+          status: response.status,
+          durationMs: Math.round(performance.now() - started),
+          passed,
+          assertions,
+          body,
+          attempts,
+          attemptStatuses,
+        },
+        captures,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // A missing variable or a failed capture is a collection error,
+      // not a flaky server — retrying it would fail the same way.
+      const isRetryable =
+        !message.startsWith("Missing environment variable:") &&
+        !message.startsWith("Capture failed:");
+      lastError = message;
+      if (isRetryable && attempt + 1 < maxAttempts) {
+        await sleep((retry?.delayMs ?? 100) * 2 ** attempt);
+        continue;
+      }
+      return {
+        result: {
+          name: spec.name,
+          method: spec.method,
+          url: spec.url,
+          status: null,
+          durationMs: Math.round(performance.now() - started),
+          passed: false,
+          assertions: [],
+          body: "",
+          attempts,
+          attemptStatuses,
+          error: message,
+        },
+        captures: {},
+      };
     }
-    const body = response.bodyJson !== null
-      ? JSON.stringify(response.bodyJson, null, 2)
-      : response.bodyText;
-    return {
-      result: {
-        name: spec.name,
-        method: spec.method,
-        url: substitute(spec.url, vars),
-        status: response.status,
-        durationMs: response.durationMs,
-        passed,
-        assertions,
-        body,
-      },
-      captures,
-    };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return {
-      result: {
-        name: spec.name,
-        method: spec.method,
-        url: spec.url,
-        status: null,
-        durationMs: Math.round(performance.now() - started),
-        passed: false,
-        assertions: [],
-        body: "",
-        error: message,
-      },
-      captures: {},
-    };
   }
+  // Unreachable in practice: the loop always returns on its last attempt.
+  return {
+    result: {
+      name: spec.name,
+      method: spec.method,
+      url: spec.url,
+      status: null,
+      durationMs: Math.round(performance.now() - started),
+      passed: false,
+      assertions: [],
+      body: "",
+      attempts,
+      attemptStatuses,
+      error: lastError ?? "Request did not complete",
+    },
+    captures: {},
+  };
 }
 
 export interface CollectionRun {

@@ -1,6 +1,6 @@
 # http-file-runner
 
-**Run named HTTP requests from a `requests.yaml` file — with environments, assertions, chaining and CI mode. Zero runtime dependencies, Node 18+.**
+**Run named HTTP requests from a `requests.yaml` file — with environments, assertions, chaining, retries, HTML reports and a mock server. Zero runtime dependencies, Node 18+.**
 
 ```bash
 npx http-file-runner run --all
@@ -39,6 +39,9 @@ If you already use Postman or Bruno happily, especially for exploratory testing 
 - **`{{VAR}}` templating** — `{{BASE_URL}}`, `{{TOKEN}}`, with `{{VAR:-default}}` fallbacks. A missing variable fails with its name, not a confusing 404.
 - **Assertions** — `expect.status`, `expect.json.path` (+ `equals`), `expect.json.contains`, `expect.contains`, `expect.header`.
 - **Chaining** — `capture: { token: "$.token" }` saves a value from one response for the next request.
+- **Retries (v0.2.0)** — `retry: { count: 2, delayMs: 100, on: [500, 502, 503] }` re-attempts flaky requests with exponential backoff; every attempt's status is reported.
+- **HTML reports (v0.2.0)** — `--report-html report.html` writes a self-contained HTML report. Response bodies are intentionally omitted, so no token ever lands in a shareable file.
+- **Mock server (v0.2.0)** — `http-run serve` serves the `mock:` example response of each request, so frontend work can start before the real API exists.
 - **Pretty JSON output** — response bodies are pretty-printed; status and timing are shown per request.
 - **`init`** — scaffold a sample collection and `.env.example`.
 - **`export`** — print the `curl` equivalent of any request.
@@ -124,6 +127,57 @@ requests:
 
 JSON paths look like `$.user.id`, `$.items[0].name`, or `$.items.0.name`.
 
+### Retries (v0.2.0)
+
+A flaky endpoint should not fail your whole run. Add `retry:` to a request:
+
+```yaml
+  - name: get-user
+    method: GET
+    url: "{{BASE_URL}}/users/1"
+    retry:
+      count: 2        # retries after the first attempt
+      delayMs: 100    # base delay; doubled on each further retry (100ms, 200ms, …)
+      on:             # only these statuses trigger a retry
+        - 500
+        - 502
+        - 503
+```
+
+Defaults: `delayMs: 100`, `on: [500, 502, 503, 504]`. Network errors are retried too; a missing variable or a failed capture is not — retrying those would fail the same way. The output reports every attempt: `attempts: 3 (statuses: 500 → 500 → 200)`.
+
+### HTML reports (v0.2.0)
+
+```bash
+http-run run --all --report-html report.html
+```
+
+Writes a self-contained HTML report (summary, per-request status/timing/attempts, assertion results). Response bodies and assertion values are intentionally omitted, so no token ever lands in a shareable file.
+
+### Mock server (v0.2.0)
+
+Frontend work should not wait for the real API. Give a request a `mock:` example response, then serve it:
+
+```yaml
+  - name: get-user
+    method: GET
+    url: "{{BASE_URL}}/users/1"
+    mock:
+      status: 200
+      body:
+        user:
+          id: 1
+          name: Ada Lovelace
+```
+
+```bash
+http-run serve --port 3000
+# Mock server listening on http://127.0.0.1:3000
+#   GET /users/1  (get-user)
+```
+
+`mock.body` can be a mapping (sent as JSON), a string (sent as-is — JSON if it looks like JSON, otherwise plain text), or a number/boolean. Mock headers and a custom `mock.status` are supported, and `{{VAR}}` templating works in mock bodies and headers. Requests without a `mock:` return `404 {"error": "no mock defined for …"}`. Press Ctrl+C to stop.
+
 ### Chaining
 
 `capture` runs after a request and stores values for later requests in the same run:
@@ -157,8 +211,9 @@ http-run run get-user --env prod --env-file examples/env.prod.yaml
 ## Usage
 
 ```bash
-http-run run <name> [--file requests.yaml] [--env dev] [--env-file .env] [--ci] [--report out.json]
+http-run run <name> [--file requests.yaml] [--env dev] [--env-file .env] [--ci] [--report out.json] [--report-html out.html]
 http-run run --all [--file requests.yaml] [--env dev] [--ci]
+http-run serve [requests.yaml] [--port 3000] [--host 127.0.0.1] [--env dev]
 http-run list [--file requests.yaml]
 http-run export <name> [--file requests.yaml] [--env dev]
 http-run init [dir] [--force]
@@ -192,7 +247,7 @@ http-run export get-user --env dev
 - **YAML subset.** The built-in parser supports nested maps, sequences, quoted/plain scalars, numbers, booleans, null, and literal block scalars (`|`) for bodies. It does not support anchors, tags, flow collections (`[a, b]`, `{k: v}`), or multi-document files. Files using those fail loudly instead of being mis-parsed.
 - **Blank lines in block scalars.** Blank lines inside a `|` body are dropped (JSON bodies are unaffected).
 - **No request history, GUI, or cloud sync** — that is the point, but it means exploratory testing is better done in Postman/Bruno and then copied here as a checked-in test.
-- **No retries, no parallel runs.** Requests run sequentially, in file order, with a 10s default timeout (`timeoutMs` per request overrides it).
+- **No parallel runs.** Requests run sequentially, in file order, with a 10s default timeout (`timeoutMs` per request overrides it). Retries (v0.2.0) cover flaky endpoints; there is no concurrency.
 - **Secrets in URLs.** Do not put a token in a URL — it will appear in run output. Put it in a header via `{{TOKEN}}` instead.
 
 ## Development
