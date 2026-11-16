@@ -1,0 +1,48 @@
+# Example collection for http-file-runner.
+# Run against a local API:  http-run run --all --env dev --env-file examples/env.dev.yaml
+# Real secrets go in a local .env file (never committed), not here.
+environments:
+  dev:
+    BASE_URL: http://localhost:3000
+  staging:
+    BASE_URL: https://staging.example.com
+  prod:
+    BASE_URL: https://api.example.com
+
+requests:
+  - name: login
+    method: POST
+    url: "{{BASE_URL}}/login"
+    headers:
+      Content-Type: application/json
+    body: |
+      {"username": "demo", "password": "demo"}
+    capture:
+      token: "$.token"
+    expect:
+      status: 200
+      json:
+        path: "$.token"
+
+  - name: get-user
+    method: GET
+    url: "{{BASE_URL}}/users/1"
+    headers:
+      Authorization: "Bearer {{token}}"
+    expect:
+      status: 200
+      json:
+        path: "$.user.id"
+        equals: 1
+      header:
+        content-type: "application/json"
+
+  - name: list-users
+    method: GET
+    url: "{{BASE_URL}}/users"
+    headers:
+      Authorization: "Bearer {{token}}"
+    expect:
+      status: 200
+      json:
+        contains: "Ada Lovelace"
